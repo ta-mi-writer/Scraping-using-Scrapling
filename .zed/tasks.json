@@ -1,0 +1,10 @@
+[
+  {
+    "label": "Run Current Python File (uv)",
+    "command": "uv run --env-file .env ${ZED_FILE}",
+  },
+  {
+    "label": "Run Tests (uv)",
+    "command": "uv run --env-file .env tryke test",
+  },
+]
