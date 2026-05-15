@@ -1,7 +1,7 @@
 """PDF URLを抽出するスクリプト。
 
 official_url が保存されている各補助金エントリのページから、
-ページ内に存在するPDFファイルのURLを抽出して pdf_urls フィールドとして追加する。
+ページ内に存在するPDFファイルのURLを抽出して pdf_files フィールドとして追加する。
 """
 
 import json
@@ -67,8 +67,8 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
     print(f"  [{index}/{total}] スキップ(official_urlなし): {name}")
     return (False, True)
 
-  # 既に pdf_urls があればスキップ
-  if "pdf_urls" in entry:
+  # 既に pdf_files があればスキップ
+  if "pdf_files" in entry:
     print(f"  [{index}/{total}] スキップ(既に処理済み): {name}")
     return (False, True)
 
@@ -87,7 +87,7 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
         continue
 
       pdf_urls = extract_pdf_urls(html, official_url)
-      entry["pdf_urls"] = pdf_urls
+      entry["pdf_files"] = [{"url": url, "path": None} for url in pdf_urls]
 
       if pdf_urls:
         print(f"    ✅ PDF数: {len(pdf_urls)}件")
@@ -99,7 +99,7 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
       if attempt < MAX_RETRIES:
         time.sleep(RETRY_DELAY)
       else:
-        entry["pdf_urls"] = []
+        entry["pdf_files"] = []
         print(f"    ❌ 全リトライ失敗: {e}")
         return (False, False)
     else:
@@ -109,7 +109,7 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
 
 
 def main() -> None:
-  """メイン処理。subsidies_output.json の各エントリに pdf_urls を追加する。"""
+  """メイン処理。subsidies_output.json の各エントリに pdf_files を追加する。"""
   # データ読み込み
   with INPUT_FILE.open("r", encoding="utf-8") as f:
     data = json.load(f)
