@@ -58,7 +58,7 @@ def download_pdf(url: str, dest: Path) -> bool:
       print(f"      [リトライ {attempt}/{MAX_RETRIES}] エラー: {e}")
       if attempt < MAX_RETRIES:
         time.sleep(RETRY_DELAY)
-
+    else:
       return True
 
   return False
@@ -98,10 +98,13 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
   for i, pdf_file in enumerate(entry["pdf_files"], 1):
     url = pdf_file["url"]
 
-    # 既に path が設定済みならスキップ
+    # 既に path が設定済みでファイルが実在すればスキップ
     if pdf_file.get("path") is not None:
-      skipped_count += 1
-      continue
+      if Path(pdf_file["path"]).exists():
+        skipped_count += 1
+        continue
+      # ファイルが消されていたら再ダウンロードのため path をリセット
+      pdf_file["path"] = None
 
     filename = extract_filename(url, i)
     dest = dest_dir / filename
