@@ -10,3 +10,5 @@ extracted_posts.json
 subsidies_output.json
 memo.md
 pdfs
+
+scripts/__pycache__
