@@ -1,24 +1,23 @@
 r"""PDF 一括抽出スクリプト.
 
-- 指定フォルダ内の全 PDF を Markdown 形式に変換
+- データベースの pdf_files テーブルから URL を取得してテキスト化
 - URL を直接指定して PDF をダウンロードして変換することも可能
-- サブフォルダも再帰的に検索可能
+- ローカルファイル/フォルダから変換することも可能
 
 使い方:
-    # ローカルファイル/フォルダ
-    uv run scripts/extract_pdfs.py --input ./pdfs/ --output ./output/
-    uv run scripts/extract_pdfs.py --input ./pdfs/73105/ --output ./output/
+    # データベースから
+    uv run scripts/extract_pdfs.py --from-db --output ./output/
 
     # URL から直接
     uv run scripts/extract_pdfs.py \\
       --input https://example.com/doc.pdf --output ./output/
 
-    # subsidies_output.json の pdf_files から一括処理
-    uv run scripts/extract_pdfs.py --from-json subsidies_output.json --output ./output/
+    # ローカルファイル/フォルダ
+    uv run scripts/extract_pdfs.py --input ./pdfs/ --output ./output/
 """
 
 import argparse
-import json
+import logging
 import sys
 from datetime import UTC, datetime
 from io import BytesIO
@@ -27,7 +26,12 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import pdfplumber
+from models import PdfFile
 from scrapling.fetchers import Fetcher
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from pdfplumber.page import Page
@@ -111,35 +115,49 @@ def extract_page_content(page: Page) -> str:
   return "\n".join(content)
 
 
-def extract_pdf_from_bytes(pdf_bytes: bytes, source_name: str) -> str:
-  """PDF バイトデータから Markdown を抽出"""
+def _build_pdf_markdown_header(source_name: str, source_info: str | None) -> list[str]:
+  """PDF Markdown ヘッダーを構築"""
   lines = []
   lines.append(f"# {source_name}")
   lines.append("")
   lines.append(f"- 抽出日時: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')}")
-  lines.append(f"- ソース: {source_name}")
+  if source_info:
+    lines.append(f"- ソース: {source_info}")
   lines.append("")
   lines.append("---")
   lines.append("")
+  return lines
 
-  with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-    lines.append(f"**総ページ数: {len(pdf.pages)}**")
+
+def _extract_pages_to_markdown(pdf: pdfplumber.pdf.PDF) -> str:
+  """PDF ページを Markdown に変換"""
+  lines = []
+  lines.append(f"**総ページ数: {len(pdf.pages)}**")
+  lines.append("")
+
+  for i, page in enumerate(pdf.pages):
+    lines.append(f"## ページ {i + 1}")
     lines.append("")
 
-    for i, page in enumerate(pdf.pages):
-      lines.append(f"## ページ {i + 1}")
-      lines.append("")
+    page_content = extract_page_content(page)
+    lines.append(
+      page_content
+      if page_content.strip()
+      else "*(このページには抽出可能なコンテンツがありません)*"
+    )
 
-      page_content = extract_page_content(page)
-      if page_content.strip():
-        lines.append(page_content)
-      else:
-        lines.append("*(このページには抽出可能なコンテンツがありません)*")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
 
-      lines.append("")
-      lines.append("---")
-      lines.append("")
+  return "\n".join(lines)
 
+
+def extract_pdf_from_bytes(pdf_bytes: bytes, source_name: str) -> str:
+  """PDF バイトデータから Markdown を抽出"""
+  lines = _build_pdf_markdown_header(source_name, source_name)
+  with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+    lines.append(_extract_pages_to_markdown(pdf))
   return "\n".join(lines)
 
 
@@ -149,32 +167,9 @@ def extract_pdf_to_markdown(pdf_path: str, output_path: str | None = None) -> st
   if output_path is None:
     output_path = str(pdf_path_obj.with_suffix(".md"))
 
-  lines = []
-  lines.append(f"# {pdf_path_obj.name}")
-  lines.append("")
-  lines.append(f"- 抽出日時: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')}")
-  lines.append(f"- ファイルパス: {pdf_path}")
-  lines.append("")
-  lines.append("---")
-  lines.append("")
-
+  lines = _build_pdf_markdown_header(pdf_path_obj.name, pdf_path)
   with pdfplumber.open(pdf_path) as pdf:
-    lines.append(f"**総ページ数: {len(pdf.pages)}**")
-    lines.append("")
-
-    for i, page in enumerate(pdf.pages):
-      lines.append(f"## ページ {i + 1}")
-      lines.append("")
-
-      page_content = extract_page_content(page)
-      if page_content.strip():
-        lines.append(page_content)
-      else:
-        lines.append("*(このページには抽出可能なコンテンツがありません)*")
-
-      lines.append("")
-      lines.append("---")
-      lines.append("")
+    lines.append(_extract_pages_to_markdown(pdf))
 
   markdown_text = "\n".join(lines)
   Path(output_path).write_text(markdown_text, encoding="utf-8")
@@ -188,6 +183,14 @@ def download_pdf_from_url(url: str) -> bytes:
   if not page.body:
     msg = f"レスポンスが空です: {url}"
     raise ValueError(msg)
+
+  # Content-Type ヘッダーの確認
+  content_type = page.headers.get("content-type", "")
+  if "pdf" not in content_type.lower():
+    logger.warning(
+      "Content-Type が PDF ではありません: %s (URL: %s)", content_type, url
+    )
+
   return page.body
 
 
@@ -213,67 +216,64 @@ def find_pdf_files(input_dir: str, *, recursive: bool = True) -> list[str]:
   return sorted(pdf_files)
 
 
-def extract_pdf_urls_from_json(json_path: str) -> list[dict]:
-  """subsidies_output.json から PDF URL を抽出"""
-  with Path(json_path).open("r", encoding="utf-8") as f:
-    data = json.load(f)
+def process_from_db(output_dir: str, limit: int | None = None) -> tuple[int, int, list]:
+  """データベースの pdf_files テーブルから PDF をテキスト化"""
+  engine = create_engine("sqlite:///data/subsidies.db")
+  batch_size = 10  # バッチコミット用
 
-  results = []
-  for entry in data:
-    if "pdf_files" not in entry or not entry["pdf_files"]:
-      continue
-    for pdf_file in entry["pdf_files"]:
-      url = pdf_file.get("url")
-      if url:
-        results.append(
-          {
-            "url": url,
-            "name": entry.get("name", "不明"),
-            "detail_url": entry.get("detail_url", ""),
-          }
-        )
-  return results
+  with Session(engine) as session:
+    query = select(PdfFile).where(PdfFile.extracted_text_path.is_(None))
+    if limit:
+      query = query.limit(limit)
+    pdfs = session.execute(query).scalars().all()
 
+    total = len(pdfs)
+    print(f"データベースから {total} 件の PDF URL を読み込みました")
+    print(f"出力: {output_dir}")
+    print()
 
-def process_from_json(json_path: str, output_dir: str) -> tuple[int, int, list]:
-  """JSON から PDF URL を読み込んで一括処理"""
-  pdf_entries = extract_pdf_urls_from_json(json_path)
-  print(f"JSON から {len(pdf_entries)} 件の PDF URL を読み込みました")
-  print(f"出力: {output_dir}")
-  print()
+    success_count = 0
+    error_count = 0
+    error_files = []
 
-  success_count = 0
-  error_count = 0
-  error_files = []
+    for i, pdf_file in enumerate(pdfs, 1):
+      url = pdf_file.url
+      print(f"[{i}/{total}] 処理中: {url[:60]}")
 
-  for i, entry in enumerate(pdf_entries, 1):
-    url = entry["url"]
-    name = entry["name"]
-    print(f"[{i}/{len(pdf_entries)}] 処理中: {name}")
-    print(f"  URL: {url}")
+      try:
+        pdf_bytes = download_pdf_from_url(url)
+        source_name = Path(urlparse(url).path).name or "download.pdf"
+        markdown_text = extract_pdf_from_bytes(pdf_bytes, source_name)
 
-    try:
-      pdf_bytes = download_pdf_from_url(url)
-      markdown_text = extract_pdf_from_bytes(pdf_bytes, name)
+        filename = Path(urlparse(url).path).stem + ".md"
+        output_path = str(Path(output_dir) / filename)
 
-      filename = Path(urlparse(url).path).stem + ".md"
-      if not filename.endswith(".md"):
-        filename = f"{name[:50]}.md"
-      output_path = str(Path(output_dir) / filename)
+        counter = 1
+        while Path(output_path).exists():
+          stem = Path(filename).stem
+          output_path = str(Path(output_dir) / f"{stem}_{counter}.md")
+          counter += 1
 
-      counter = 1
-      while Path(output_path).exists():
-        stem = Path(filename).stem
-        output_path = str(Path(output_dir) / f"{stem}_{counter}.md")
-        counter += 1
+        Path(output_path).write_text(markdown_text, encoding="utf-8")
 
-      Path(output_path).write_text(markdown_text, encoding="utf-8")
-      print(f"  完了: {output_path}")
-      success_count += 1
-    except (ValueError, OSError, RuntimeError) as e:
-      print(f"  エラー: {e}")
-      error_count += 1
-      error_files.append((url, str(e)))
+        # extracted_text_path を更新
+        pdf_file.extracted_text_path = output_path
+
+        print(f"  完了: {output_path}")
+        success_count += 1
+
+        # バッチコミット
+        if success_count % batch_size == 0:
+          session.commit()
+          logger.debug("バッチコミット: %d 件処理済み", success_count)
+
+      except (ValueError, OSError, RuntimeError) as e:
+        print(f"  エラー: {e}")
+        error_count += 1
+        error_files.append((url, str(e)))
+
+    # 最終コミット
+    session.commit()
 
   return success_count, error_count, error_files
 
@@ -353,21 +353,26 @@ def process_from_local(
 
 def main() -> None:
   """メイン関数"""
+  # ロギング設定
+  logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+  )
+
   parser = argparse.ArgumentParser(
     description="PDF ファイルを Markdown 形式に変換します",
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog="""
 使用例:
-  # ローカルファイル/フォルダ
-  uv run scripts/extract_pdfs.py --input ./pdfs/ --output ./output/
-  uv run scripts/extract_pdfs.py --input ./pdfs/73105/ --output ./output/
+  # データベースから
+  uv run scripts/extract_pdfs.py --from-db --output ./output/
 
   # URL から直接
   uv run scripts/extract_pdfs.py \\
     --input https://example.com/doc.pdf --output ./output/
 
-  # subsidies_output.json の pdf_files から一括処理
-  uv run scripts/extract_pdfs.py --from-json subsidies_output.json --output ./output/
+  # ローカルファイル/フォルダ
+  uv run scripts/extract_pdfs.py --input ./pdfs/ --output ./output/
         """,
   )
   parser.add_argument(
@@ -387,26 +392,33 @@ def main() -> None:
     help="サブフォルダを検索しない",
   )
   parser.add_argument(
-    "--from-json",
-    type=str,
-    help="subsidies_output.json から PDF URL を読み込んで一括処理",
+    "--from-db",
+    action="store_true",
+    help="データベースの pdf_files テーブルから PDF をテキスト化",
+  )
+  parser.add_argument(
+    "--limit",
+    type=int,
+    default=None,
+    help="処理する最大件数(テスト用)",
   )
 
   args = parser.parse_args()
 
-  if not args.input and not args.from_json:
-    parser.error("--input または --from-json のいずれかを指定してください")
+  if not args.input and not args.from_db:
+    parser.error("--input または --from-db のいずれかを指定してください")
 
   output_dir = args.output
-  Path(output_dir).mkdir(parents=True, exist_ok=True)
+  if args.from_db or (args.input and not is_url(args.input)):
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
   success_count = 0
   error_count = 0
   error_files: list[tuple[str, str]] = []
 
-  if args.from_json:
-    success_count, error_count, error_files = process_from_json(
-      args.from_json, output_dir
+  if args.from_db:
+    success_count, error_count, error_files = process_from_db(
+      output_dir, limit=args.limit
     )
   elif args.input:
     if is_url(args.input):

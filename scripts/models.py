@@ -1,42 +1,70 @@
-"""データベースモデル定義モジュール
+"""SQLAlchemy モデル定義.
 
-このモジュールには、アプリケーションで使用する。
-SQLAlchemy の ORM モデルが定義されています。
-各モデルはデータベーステーブルに対応しており、データの永続化と操作を行います。
-
-Classes:
-    Base: すべてのORMモデルクラスの基底クラス。
-    Product: 商品情報を表すデータベースモデル。
+subsidies テーブル: 補助金の基本情報
+pdf_files テーブル: PDF ファイル情報（subsidies と関連）
 """
 
-from sqlalchemy import String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from datetime import UTC, datetime
+
+from sqlalchemy import DateTime, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
-  """すべてのORMモデルクラスの基底クラス。
-
-  このクラスを継承することで、SQLAlchemyの宣言的モデルシステムを使用できるようになります。
-  """
+  """全モデルの基底クラス."""
 
 
-class Product(Base):
-  """商品情報を表すデータベースモデル。
 
-  Attributes:
-      id (int): 商品の一意な識別子。
-      slug (str): 商品のURLスラッグ。一意である必要があります。
-      name (str | None): 商品の名前。
-      description (str | None): 商品の説明。
-      price (int | None): 商品の価格。
-      is_detailed_scraped (bool): 詳細情報がスクレイピングされたかどうか。
-  """
+class Subsidy(Base):
+  """補助金情報を格納するテーブル."""
 
-  __tablename__ = "products"
+  __tablename__ = "subsidies"
 
-  id: Mapped[int] = mapped_column(primary_key=True)
-  slug: Mapped[str] = mapped_column(String(100), unique=True)
-  name: Mapped[str | None] = mapped_column(String(100))
-  description: Mapped[str | None] = mapped_column(String(200))
-  price: Mapped[int | None] = mapped_column()
-  is_detailed_scraped: Mapped[bool] = mapped_column(default=False)
+  id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+  name: Mapped[str] = mapped_column(Text, nullable=False)
+  detail_url: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+  application_period: Mapped[str | None] = mapped_column(Text)
+  upper_limit_yen: Mapped[int | None] = mapped_column(Integer)
+  status: Mapped[str | None] = mapped_column(Text)
+  official_url: Mapped[str | None] = mapped_column(Text)
+  created_at: Mapped[datetime] = mapped_column(
+    DateTime, default=lambda: datetime.now(UTC)
+  )
+  updated_at: Mapped[datetime] = mapped_column(
+    DateTime,
+    default=lambda: datetime.now(UTC),
+    onupdate=lambda: datetime.now(UTC),
+  )
+
+  # リレーションシップ
+  pdf_files: Mapped[list[PdfFile]] = relationship(
+    back_populates="subsidy", cascade="all, delete-orphan"
+  )
+
+  def __repr__(self) -> str:
+    """デバッグ用の文字列表現."""
+    return f"<Subsidy(id={self.id}, name='{self.name[:30]}...')>"
+
+
+class PdfFile(Base):
+  """PDF ファイル情報を格納するテーブル."""
+
+  __tablename__ = "pdf_files"
+  __table_args__ = (UniqueConstraint("subsidy_id", "url", name="uq_subsidy_pdf_url"),)
+
+  id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+  subsidy_id: Mapped[int] = mapped_column(
+    Integer, ForeignKey("subsidies.id"), nullable=False
+  )
+  url: Mapped[str] = mapped_column(Text, nullable=False)
+  extracted_text_path: Mapped[str | None] = mapped_column(Text)
+  created_at: Mapped[datetime] = mapped_column(
+    DateTime, default=lambda: datetime.now(UTC)
+  )
+
+  # リレーションシップ
+  subsidy: Mapped[Subsidy] = relationship(back_populates="pdf_files")
+
+  def __repr__(self) -> str:
+    """デバッグ用の文字列表現."""
+    return f"<PdfFile(id={self.id}, url='{self.url[:50]}...')>"

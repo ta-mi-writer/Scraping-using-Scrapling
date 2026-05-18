@@ -1,19 +1,20 @@
 """PDF URLを抽出するスクリプト。
 
-official_url が保存されている各補助金エントリのページから、
-ページ内に存在するPDFファイルのURLを抽出して pdf_files フィールドとして追加する。
+subsidies テーブルの official_url からページを取得し、
+ページ内に存在するPDFファイルのURLを抽出して pdf_files テーブルに保存する。
 """
 
-import json
 import time
-from pathlib import Path
 from urllib.parse import urljoin
 
+from models import PdfFile, Subsidy
 from scrapling.fetchers import Fetcher
 from scrapling.parser import Selector
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
-INPUT_FILE = Path(__file__).parent.parent / "subsidies_output.json"
-OUTPUT_FILE = INPUT_FILE  # 上書き保存
+# データベースパス
+DB_PATH = "data/subsidies.db"
 
 # リトライ設定
 MAX_RETRIES = 3
@@ -46,33 +47,34 @@ def extract_pdf_urls(html: str, base_url: str) -> list[str]:
   return sorted(pdf_urls)
 
 
-def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
-  """1件のエントリを処理する。
+def process_subsidy(
+  subsidy: Subsidy, index: int, total: int, session: Session
+) -> tuple[bool, bool]:
+  """1件の補助金レコードを処理する。
 
   Args:
-      entry: 補助金エントリの辞書。
+      subsidy: 補助金レコード。
       index: 現在のインデックス（1から始まる）。
-      total: 総エントリ数。
+      total: 総レコード数。
+      session: SQLAlchemy セッション。
 
   Returns:
       tuple: (成功フラグ, スキップフラグ) のタプル。
-          - 成功フラグ: PDF URL抽出が成功したかどうか。
-          - スキップフラグ: スキップだったかどうか。
   """
-  name = entry.get("name", "不明")
-  official_url = entry.get("official_url")
+  name = subsidy.name
+  official_url = subsidy.official_url
 
-  # official_urlがない場合はスキップ
+  # official_url がない場合はスキップ
   if not official_url:
-    print(f"  [{index}/{total}] スキップ(official_urlなし): {name}")
+    print(f"  [{index}/{total}] スキップ(official_urlなし): {name[:40]}")
     return (False, True)
 
-  # 既に pdf_files があればスキップ
-  if "pdf_files" in entry:
-    print(f"  [{index}/{total}] スキップ(既に処理済み): {name}")
+  # 既に pdf_files が存在する場合はスキップ
+  if subsidy.pdf_files:
+    print(f"  [{index}/{total}] スキップ(既に処理済み): {name[:40]}")
     return (False, True)
 
-  print(f"  [{index}/{total}] 取得中: {name}")
+  print(f"  [{index}/{total}] 取得中: {name[:40]}")
   print(f"    URL: {official_url}")
 
   # リトライ付きで取得
@@ -87,7 +89,14 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
         continue
 
       pdf_urls = extract_pdf_urls(html, official_url)
-      entry["pdf_files"] = [{"url": url, "path": None} for url in pdf_urls]
+
+      # pdf_files テーブルに保存
+      for url in pdf_urls:
+        pdf_file = PdfFile(
+          subsidy_id=subsidy.id,
+          url=url,
+        )
+        session.add(pdf_file)
 
       if pdf_urls:
         print(f"    ✅ PDF数: {len(pdf_urls)}件")
@@ -99,7 +108,6 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
       if attempt < MAX_RETRIES:
         time.sleep(RETRY_DELAY)
       else:
-        entry["pdf_files"] = []
         print(f"    ❌ 全リトライ失敗: {e}")
         return (False, False)
     else:
@@ -109,43 +117,47 @@ def process_entry(entry: dict, index: int, total: int) -> tuple[bool, bool]:
 
 
 def main() -> None:
-  """メイン処理。subsidies_output.json の各エントリに pdf_files を追加する。"""
-  # データ読み込み
-  with INPUT_FILE.open("r", encoding="utf-8") as f:
-    data = json.load(f)
+  """メイン処理。"""
+  engine = create_engine(f"sqlite:///{DB_PATH}")
 
-  print(f"読み込み済みエントリ数: {len(data)}")
-  print("処理開始: subsidies_output.json")
-  print("=" * 60)
+  with Session(engine) as session:
+    # official_url が設定されているレコードを取得
+    subsidies = (
+      session.execute(select(Subsidy).where(Subsidy.official_url.is_not(None)))
+      .scalars()
+      .all()
+    )
 
-  success_count = 0
-  skip_count = 0
-  fail_count = 0
+    total = len(subsidies)
+    print(f"処理対象: {total}件")
+    print("=" * 60)
 
-  for i, entry in enumerate(data, 1):
-    success, skipped = process_entry(entry, i, len(data))
-    if skipped:
-      skip_count += 1
-    elif success:
-      success_count += 1
-    else:
-      fail_count += 1
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
 
-    # リクエスト間ウェイト
-    if i < len(data):
-      time.sleep(REQUEST_INTERVAL)
+    for i, subsidy in enumerate(subsidies, 1):
+      success, skipped = process_subsidy(subsidy, i, total, session)
+      if skipped:
+        skip_count += 1
+      elif success:
+        success_count += 1
+      else:
+        fail_count += 1
 
-  # 保存
-  with OUTPUT_FILE.open("w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+      # リクエスト間ウェイト
+      if i < total:
+        time.sleep(REQUEST_INTERVAL)
+
+    # コミット
+    session.commit()
 
   print()
   print("=" * 60)
-  print(f"処理完了: {len(data)}件中")
+  print(f"処理完了: {total}件中")
   print(f"  ✅ 成功: {success_count}件")
   print(f"  ⏭️  スキップ: {skip_count}件")
   print(f"  ❌ 失敗: {fail_count}件")
-  print(f"保存先: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":

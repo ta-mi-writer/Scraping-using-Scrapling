@@ -19,8 +19,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from models import Base, Subsidy
 from scrapling.fetchers import Fetcher
 from scrapling.parser import Selector
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:
   from scrapling.engines.toolbelt.custom import Response
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
 BASE_URL = "https://hojyokin-portal.jp/subsidies/list"
 QUERY_PARAMS = "pref_id[0]=1&city_id[0]=87&status[0]=2&status[1]=1"
 OUTPUT_FILE = Path(__file__).parent.parent / "subsidies_output.json"
+DB_PATH = Path(__file__).parent.parent / "data" / "subsidies.db"
 
 
 def build_url(page: int = 1) -> str:
@@ -173,7 +177,7 @@ async def scrape_all_pages() -> list[dict]:
   print(f"  ページ 1/{total_pages}: {len(all_results)}件")
 
   for page_num in range(2, total_pages + 1):
-    url = build_url(page=page_num)
+    url = build_url(page_num)
     print(f"  ページ {page_num}/{total_pages} を取得中...")
     page = Fetcher.get(url)
     items = extract_subsidy_items(page)
@@ -183,8 +187,63 @@ async def scrape_all_pages() -> list[dict]:
   return all_results
 
 
+def init_db() -> None:
+  """データベースを初期化する。"""
+  DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+  engine = create_engine(f"sqlite:///{DB_PATH}")
+  Base.metadata.create_all(engine)
+  print(f"データベースを初期化しました: {DB_PATH}")
+
+
+def save_to_db(results: list[dict]) -> tuple[int, int]:
+  """スクレイピング結果をデータベースに保存する。
+
+  detail_url が既に存在する場合は更新、存在しない場合は新規追加する。
+
+  Args:
+      results: スクレイピング結果の辞書リスト。
+
+  Returns:
+      tuple: (新規追加件数, 更新件数)。
+  """
+  engine = create_engine(f"sqlite:///{DB_PATH}")
+  added_count = 0
+  updated_count = 0
+
+  with Session(engine) as session:
+    for item in results:
+      existing = session.query(Subsidy).filter_by(detail_url=item["detail_url"]).first()
+
+      if existing:
+        # 既存レコードを更新
+        existing.name = item["name"]
+        existing.application_period = item["application_period"]
+        existing.upper_limit_yen = item["upper_limit_yen"]
+        existing.status = item["status"]
+        updated_count += 1
+      else:
+        # 新規レコードを追加
+        subsidy = Subsidy(
+          name=item["name"],
+          detail_url=item["detail_url"],
+          application_period=item["application_period"],
+          upper_limit_yen=item["upper_limit_yen"],
+          status=item["status"],
+        )
+        session.add(subsidy)
+        added_count += 1
+
+    session.commit()
+
+  return added_count, updated_count
+
+
 def main() -> None:
   """メイン処理。"""
+  # データベース初期化
+  init_db()
+
+  # スクレイピング実行
   results = asyncio.run(scrape_all_pages())
 
   print(f"\n{'=' * 60}")
@@ -202,9 +261,14 @@ def main() -> None:
     print(f"    ステータス : {item['status']}")
     print()
 
+  # DB 保存
+  added, updated = save_to_db(results)
+  print(f"DB 保存完了: 新規 {added}件, 更新 {updated}件")
+
+  # JSON 保存（バックアップ用）
   with OUTPUT_FILE.open("w", encoding="utf-8") as f:
     json.dump(results, f, ensure_ascii=False, indent=2)
-  print(f"結果を {OUTPUT_FILE} に保存しました。")
+  print(f"JSON バックアップ: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
