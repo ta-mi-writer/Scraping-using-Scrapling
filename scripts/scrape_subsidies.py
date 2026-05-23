@@ -31,9 +31,15 @@ if TYPE_CHECKING:
 
 # === 設定 ===
 BASE_URL = "https://hojyokin-portal.jp/subsidies/list"
-QUERY_PARAMS = "pref_id[0]=1&city_id[0]=87&status[0]=2&status[1]=1"
+QUERY_PARAMS = (
+    "pref_id[0]=1&city_id[0]=44&city_id[1]=42&city_id[2]=122&city_id[3]=76&city_id[4]=23"
+    "&city_id[5]=41&city_category_id[0]=1&status[0]=1&status[1]=2"
+)
 OUTPUT_FILE = Path(__file__).parent.parent / "subsidies_output.json"
 DB_PATH = Path(__file__).parent.parent / "data" / "subsidies.db"
+
+# ディスクリプション用CSSセレクタ（サイト構造に応じて調整）
+DESCRIPTION_SELECTOR = "div.c-card-hojokin__desc::text"
 
 
 def build_url(page: int = 1) -> str:
@@ -133,6 +139,10 @@ def extract_subsidy_items(page: Response) -> list[dict]:
       with suppress(ValueError):
         upper_limit_yen = int(cleaned) * 10_000
 
+    # --- ディスクリプション ---
+    description_raw = card.css(DESCRIPTION_SELECTOR).get()
+    description = description_raw.strip() if description_raw else None
+
     results.append(
       {
         "name": name,
@@ -140,6 +150,7 @@ def extract_subsidy_items(page: Response) -> list[dict]:
         "application_period": application_period,
         "upper_limit_yen": upper_limit_yen,
         "status": status,
+        "description": description,
       }
     )
 
@@ -217,6 +228,7 @@ def save_to_db(results: list[dict]) -> tuple[int, int]:
       if existing:
         # 既存レコードを更新
         existing.name = item["name"]
+        existing.description = item["description"]
         existing.application_period = item["application_period"]
         existing.upper_limit_yen = item["upper_limit_yen"]
         existing.status = item["status"]
@@ -225,6 +237,7 @@ def save_to_db(results: list[dict]) -> tuple[int, int]:
         # 新規レコードを追加
         subsidy = Subsidy(
           name=item["name"],
+          description=item["description"],
           detail_url=item["detail_url"],
           application_period=item["application_period"],
           upper_limit_yen=item["upper_limit_yen"],
@@ -259,6 +272,8 @@ def main() -> None:
     )
     print(f"    上限金額   : {upper_limit}")
     print(f"    ステータス : {item['status']}")
+    if item.get("description"):
+      print(f"    概要      : {item['description'][:60]}...")
     print()
 
   # DB 保存
